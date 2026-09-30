@@ -37,3 +37,23 @@ LOCATIONS = ["redmond"]
 
 # Optional: only include jobs whose title mentions "intern" (set True for intern-only mode)
 INTERN_ONLY = False
+
+# For Simplify feeds: the source already restricts to internships + new-grad and
+# to your target companies. Just reject clearly non-engineering roles by title.
+SIMPLIFY_EXCLUDE_KEYWORDS = [
+    "marketing",
+    "sales",
+    "business analyst",
+    "business development",
+    "human resources",
+    "finance",
+    "accounting",
+    "recruiter",
+    "communications",
+    "legal",
+    "paralegal",
+    "supply chain",
+    "customer",
+    "helpdesk",
+    "help desk",
+]

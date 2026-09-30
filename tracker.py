@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List
@@ -15,12 +16,18 @@ from dotenv import load_dotenv
 
 import config
 from scrapers.nintendo import Job, fetch_jobs as fetch_nintendo
+from scrapers.simplify import fetch_jobs as fetch_simplify
 
 SEEN_PATH = Path(__file__).with_name("seen.json")
 
-SCRAPERS = {
-    "Nintendo": fetch_nintendo,
-}
+# Each entry is (bucket_name, fetcher, uses_local_filters)
+# - Nintendo: scraped directly, filter with config.INCLUDE/EXCLUDE keywords
+# - Simplify: already company-filtered inside the scraper; it also intrinsically
+#   restricts to internships + new-grad roles, so we skip the keyword filter
+SCRAPERS = [
+    ("Nintendo", fetch_nintendo, True),
+    ("Simplify", fetch_simplify, False),
+]
 
 
 def load_seen() -> dict:
@@ -55,70 +62,100 @@ def matches_filters(job: Job) -> bool:
     return True
 
 
+def matches_simplify_filters(job: Job) -> bool:
+    """Lighter filter for Simplify listings: they're already company + intern/new-grad
+    filtered upstream, but we still reject roles we clearly don't want."""
+    title_lc = job.title.lower()
+    if any(kw in title_lc for kw in config.SIMPLIFY_EXCLUDE_KEYWORDS):
+        return False
+    return True
+
+
 def post_to_discord(webhook_url: str, jobs: Iterable[Job]) -> None:
     embeds = []
     for job in jobs:
+        # Truncate location if absurdly long (Discord field limits)
+        location = job.location if len(job.location) <= 200 else job.location[:197] + "..."
+        desc = f"**{job.company}** — {location}"
+        if job.department:
+            desc += f"\n_{job.department}_"
         embeds.append(
             {
-                "title": job.title,
+                "title": job.title[:256],
                 "url": job.url,
-                "description": f"**{job.company}** — {job.location}\n{job.department}".strip(),
-                "color": 0xE60012,  # Nintendo red-ish
+                "description": desc[:4096],
+                "color": 0xE60012,
             }
         )
 
-    # Discord limits: 10 embeds per message
-    for i in range(0, len(embeds), 10):
-        batch = embeds[i : i + 10]
+    # Discord limits: 10 embeds per message, ~30 req/min per webhook.
+    # Sleep 2.5s between batches to stay comfortably under the rate limit.
+    batch_size = 10
+    for i in range(0, len(embeds), batch_size):
+        batch = embeds[i : i + batch_size]
         payload = {
             "username": "Internship Tracker",
             "embeds": batch,
         }
         resp = requests.post(webhook_url, json=payload, timeout=15)
+        if resp.status_code == 429:
+            retry_after = float(resp.json().get("retry_after", 5))
+            print(f"  Rate limited, sleeping {retry_after:.1f}s", file=sys.stderr)
+            time.sleep(retry_after + 0.5)
+            resp = requests.post(webhook_url, json=payload, timeout=15)
         resp.raise_for_status()
+        if i + batch_size < len(embeds):
+            time.sleep(2.5)
 
 
-def run(dry_run: bool = False) -> int:
+def run(dry_run: bool = False, seed_only: bool = False) -> int:
     load_dotenv()
     webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-    if not dry_run and not webhook:
+    if not dry_run and not seed_only and not webhook:
         print("ERROR: DISCORD_WEBHOOK_URL is not set (see .env.example)", file=sys.stderr)
         return 2
 
     seen = load_seen()
     total_new: List[Job] = []
 
-    for company, fetcher in SCRAPERS.items():
-        print(f"[{company}] fetching...")
+    for bucket, fetcher, use_local_filters in SCRAPERS:
+        print(f"[{bucket}] fetching...")
         try:
             jobs = fetcher()
         except Exception as e:
-            print(f"[{company}] ERROR: {e}", file=sys.stderr)
+            print(f"[{bucket}] ERROR: {e}", file=sys.stderr)
             continue
 
-        matched = [j for j in jobs if matches_filters(j)]
-        print(f"[{company}] {len(jobs)} total, {len(matched)} match filters")
+        if use_local_filters:
+            matched = [j for j in jobs if matches_filters(j)]
+        else:
+            matched = [j for j in jobs if matches_simplify_filters(j)]
+        print(f"[{bucket}] {len(jobs)} total, {len(matched)} match filters")
 
-        company_seen = set(seen.get(company, []))
-        new_jobs = [j for j in matched if j.job_id not in company_seen]
-        print(f"[{company}] {len(new_jobs)} new")
+        bucket_seen = set(seen.get(bucket, []))
+        new_jobs = [j for j in matched if j.job_id not in bucket_seen]
+        print(f"[{bucket}] {len(new_jobs)} new")
 
         for j in new_jobs:
-            print(f"  + {j.title} — {j.location}")
+            print(f"  + [{j.company}] {j.title} — {j.location}")
 
         total_new.extend(new_jobs)
 
-        if not dry_run:
-            # Only mark as seen after we've decided to post them (post first below)
-            pass
-
         # Save the union of previously-seen and currently-matched IDs so filter
-        # changes don't cause old jobs to reappear. Also include currently-matched
-        # so we don't spam if the run is interrupted before posting.
-        seen[company] = sorted(company_seen.union(j.job_id for j in matched))
+        # changes don't cause old jobs to reappear. Include currently-matched
+        # regardless of posting result to avoid re-spamming on interrupted runs.
+        seen[bucket] = sorted(bucket_seen.union(j.job_id for j in matched))
 
     if dry_run:
         print(f"\n[dry-run] would post {len(total_new)} new jobs; not saving state")
+        return 0
+
+    if seed_only:
+        save_seen(seen)
+        print(
+            f"\n[seed] marked {len(total_new)} currently-open jobs as seen; "
+            f"future runs will only post new ones. State saved to {SEEN_PATH.name}"
+        )
         return 0
 
     if total_new:
@@ -138,8 +175,13 @@ def run(dry_run: bool = False) -> int:
 def main() -> None:
     p = argparse.ArgumentParser(description="Track internship/job postings.")
     p.add_argument("--dry-run", action="store_true", help="Print matches without posting or saving state")
+    p.add_argument(
+        "--seed",
+        action="store_true",
+        help="Mark all currently-open matches as seen without posting; use on first run",
+    )
     args = p.parse_args()
-    sys.exit(run(dry_run=args.dry_run))
+    sys.exit(run(dry_run=args.dry_run, seed_only=args.seed))
 
 
 if __name__ == "__main__":
