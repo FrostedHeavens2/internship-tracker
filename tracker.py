@@ -71,12 +71,61 @@ def matches_simplify_filters(job: Job) -> bool:
     return True
 
 
-def post_to_discord(webhook_url: str, jobs: Iterable[Job]) -> None:
-    embeds = []
+def _group_by_role(jobs: Iterable[Job]) -> List[Job]:
+    """Collapse postings that are the same role across multiple offices into
+    one entry. Keyed on (company, title). Locations are merged (deduped,
+    sorted). The first-seen url/job_id/department wins as the canonical.
+
+    This prevents the "RTX Software Engineer/Developer 1 posted 5 times"
+    problem where Simplify treats each office as a distinct listing.
+    """
+    grouped: dict[tuple[str, str], dict] = {}
+    order: List[tuple[str, str]] = []
     for job in jobs:
+        key = (job.company, job.title.strip())
+        if key not in grouped:
+            grouped[key] = {
+                "company": job.company,
+                "title": job.title,
+                "url": job.url,
+                "job_id": job.job_id,
+                "department": job.department,
+                "locations": [],
+                "_seen_locs": set(),
+            }
+            order.append(key)
+        entry = grouped[key]
+        # Split comma-joined locations (Simplify often packs several in one string)
+        for loc in (p.strip() for p in job.location.split(",")):
+            if loc and loc.lower() not in entry["_seen_locs"]:
+                entry["_seen_locs"].add(loc.lower())
+                entry["locations"].append(loc)
+
+    merged: List[Job] = []
+    for key in order:
+        e = grouped[key]
+        merged.append(
+            Job(
+                company=e["company"],
+                job_id=e["job_id"],
+                title=e["title"],
+                location=", ".join(sorted(e["locations"])),
+                department=e["department"],
+                url=e["url"],
+            )
+        )
+    return merged
+
+
+def post_to_discord(webhook_url: str, jobs: Iterable[Job]) -> None:
+    # Group same role across multiple offices into one post
+    grouped = _group_by_role(jobs)
+
+    embeds = []
+    for job in grouped:
         # Truncate location if absurdly long (Discord field limits)
         location = job.location if len(job.location) <= 200 else job.location[:197] + "..."
-        desc = f"**{job.company}** — {location}"
+        desc = f"**{job.company}** — {location}" if location else f"**{job.company}**"
         if job.department:
             desc += f"\n_{job.department}_"
         embeds.append(
@@ -161,7 +210,15 @@ def run(dry_run: bool = False, seed_only: bool = False) -> int:
     if total_new:
         try:
             post_to_discord(webhook, total_new)
-            print(f"Posted {len(total_new)} new jobs to Discord")
+            # Report grouped count so logs match what actually gets posted
+            grouped_count = len(_group_by_role(total_new))
+            if grouped_count != len(total_new):
+                print(
+                    f"Posted {grouped_count} grouped roles to Discord "
+                    f"({len(total_new)} raw listings merged by (company, title))"
+                )
+            else:
+                print(f"Posted {grouped_count} new jobs to Discord")
         except Exception as e:
             print(f"ERROR posting to Discord: {e}", file=sys.stderr)
             # Don't save state so we retry next run
