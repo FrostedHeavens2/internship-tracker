@@ -15,17 +15,16 @@ import requests
 from dotenv import load_dotenv
 
 import config
-from scrapers.nintendo import Job, fetch_jobs as fetch_nintendo
+from scrapers.nintendo import Job  # Job dataclass still used; Nintendo scraper disabled
 from scrapers.simplify import fetch_jobs as fetch_simplify
 
 SEEN_PATH = Path(__file__).with_name("seen.json")
 
 # Each entry is (bucket_name, fetcher, uses_local_filters)
-# - Nintendo: scraped directly, filter with config.INCLUDE/EXCLUDE keywords
 # - Simplify: already company-filtered inside the scraper; it also intrinsically
 #   restricts to internships + new-grad roles, so we skip the keyword filter
+# Nintendo removed 2026-10-21: Brandon finished those applications.
 SCRAPERS = [
-    ("Nintendo", fetch_nintendo, True),
     ("Simplify", fetch_simplify, False),
 ]
 
@@ -118,7 +117,8 @@ def _group_by_role(jobs: Iterable[Job]) -> List[Job]:
 
 
 def post_to_discord(webhook_url: str, jobs: Iterable[Job]) -> None:
-    # Group same role across multiple offices into one post
+    # Caller is expected to pass already-grouped jobs; grouping here is a no-op
+    # for already-unique entries but kept as a safety net.
     grouped = _group_by_role(jobs)
 
     embeds = []
@@ -207,18 +207,21 @@ def run(dry_run: bool = False, seed_only: bool = False) -> int:
         )
         return 0
 
-    if total_new:
+    # Cap per run (option A): group first so the cap counts posted *roles*, not
+    # raw office-split listings. Overflow is dropped — all currently-matched
+    # IDs are already saved to `seen` above, so they won't re-queue tomorrow.
+    to_post = _group_by_role(total_new)
+    cap = getattr(config, "MAX_PER_RUN", None)
+    dropped = 0
+    if cap is not None and len(to_post) > cap:
+        dropped = len(to_post) - cap
+        to_post = to_post[:cap]
+        print(f"Capped at {cap}/run; dropped {dropped} overflow role(s)")
+
+    if to_post:
         try:
-            post_to_discord(webhook, total_new)
-            # Report grouped count so logs match what actually gets posted
-            grouped_count = len(_group_by_role(total_new))
-            if grouped_count != len(total_new):
-                print(
-                    f"Posted {grouped_count} grouped roles to Discord "
-                    f"({len(total_new)} raw listings merged by (company, title))"
-                )
-            else:
-                print(f"Posted {grouped_count} new jobs to Discord")
+            post_to_discord(webhook, to_post)
+            print(f"Posted {len(to_post)} new jobs to Discord")
         except Exception as e:
             print(f"ERROR posting to Discord: {e}", file=sys.stderr)
             # Don't save state so we retry next run

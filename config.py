@@ -1,5 +1,10 @@
 """Filter config. Edit these to tune what gets posted."""
 
+# Hard cap on how many new jobs get posted per run. Overflow is still marked
+# as "seen" so it won't re-queue tomorrow (per Brandon's request: option A,
+# drop extras to keep Claude usage down).
+MAX_PER_RUN = 5
+
 # Keywords that MUST appear in the job title (any one match qualifies).
 # Keep this list broad — "engineer" catches mechanical, electrical, aerospace,
 # systems, controls, manufacturing, etc. Software-engineer titles are rejected
